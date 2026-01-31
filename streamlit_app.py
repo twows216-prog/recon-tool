@@ -59,25 +59,20 @@ st.markdown("""
 
 # ============== FUNCTIONS ==============
 def extract_card_number(filename):
-    """Extract card number from filename - flexible matching"""
+    """Extract card number from filename - very flexible matching"""
     filename_lower = filename.lower()
     
-    # Pattern 1: Starts with number like "308-d17" or "075-D17"
-    match1 = re.match(r'^(\d+)-d17', filename_lower)
-    if match1:
-        # Remove leading zeros for consistent matching
-        return str(int(match1.group(1))), 'card_journal'
+    # P2P Statement pattern: contains "statement" and "d17-XXX-"
+    if 'statement' in filename_lower:
+        match = re.search(r'd17-(\d+)-', filename_lower)
+        if match:
+            return str(int(match.group(1))), 'p2p_statement'
     
-    # Pattern 2: Contains "d17-XXX-" like "statement-d17-308-xxx"
-    match2 = re.search(r'd17-(\d+)-', filename_lower)
-    if match2:
-        # Remove leading zeros for consistent matching
-        return str(int(match2.group(1))), 'p2p_statement'
-    
-    # Pattern 3: Any number followed by -d17 anywhere in filename
-    match3 = re.search(r'(\d+)-d17', filename_lower)
-    if match3:
-        return str(int(match3.group(1))), 'card_journal'
+    # Card Journal patterns - anything that starts with a number
+    # Examples: "342-journal-31-12-2025.csv", "308-d17-journal.csv", "075-D17-31-01-2026.csv"
+    match = re.match(r'^(\d+)', filename_lower)
+    if match:
+        return str(int(match.group(1))), 'card_journal'
     
     return None, None
 
@@ -613,7 +608,7 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.markdown("**Card Journal**")
-    st.caption("Files like: 178-D17-31-01-2026.csv")
+    st.caption("Files starting with card number (e.g., 178-D17-xxx.csv, 342-journal-xxx.csv)")
     card_files = st.file_uploader(
         "Upload Card Journal CSV files",
         type=['csv'],
@@ -623,7 +618,7 @@ with col1:
 
 with col2:
     st.markdown("**P2P Statement**")
-    st.caption("Files like: statement-d17-178-xxxxx.csv")
+    st.caption("Files with statement-d17-XXX (e.g., statement-d17-178-xxx.csv)")
     p2p_files = st.file_uploader(
         "Upload P2P Statement CSV files",
         type=['csv'],
@@ -818,11 +813,11 @@ else:
     st.markdown("---")
     st.markdown("### 👆 Upload your files to get started")
     st.markdown("""
-    **File naming:**
-    - Card Journal: `178-D17-xxxxx.csv` (card number at start)
-    - P2P Statement: `statement-d17-178-xxxxx.csv` (card number after d17-)
+    **File naming (flexible):**
+    - Card Journal: Any file starting with card number (e.g., `178-D17-xxx.csv`, `342-journal-xxx.csv`)
+    - P2P Statement: Files containing `statement-d17-XXX` (e.g., `statement-d17-178-xxx.csv`)
     """)
 
 # Footer
 st.markdown("---")
-st.caption("Card Reconciliation Tool v2.3 | IN: Auth match | OUT: Date+Amount+Account match")
+st.caption("Card Reconciliation Tool v2.4 | Flexible file naming | IN: Auth match | OUT: Date+Amount+Account match")
