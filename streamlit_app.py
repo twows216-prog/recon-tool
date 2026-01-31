@@ -142,14 +142,17 @@ def get_in_transactions_card(df, from_date):
     return incoming.reset_index(drop=True)
 
 
-def get_out_transactions_card(df, from_date, include_mandat=True, include_cashout=True):
+def get_out_transactions_card(df, from_date, include_withdrawal=True, include_mandat=True):
     """Get outgoing transactions from Card Journal (Transfert vers + Mandat)"""
     filtered = df[df['DATE'] >= from_date].copy()
     if 'LIBELLE' not in filtered.columns or filtered.empty:
         return pd.DataFrame()
     
     # Build filter conditions based on options
-    conditions = filtered['LIBELLE'].str.contains('Transfert vers', case=False, na=False)
+    conditions = pd.Series([False] * len(filtered), index=filtered.index)
+    
+    if include_withdrawal:
+        conditions = conditions | filtered['LIBELLE'].str.contains('Transfert vers', case=False, na=False)
     
     if include_mandat:
         conditions = conditions | filtered['LIBELLE'].str.contains('Mandat', case=False, na=False)
@@ -214,13 +217,16 @@ def get_in_transactions_p2p(df, from_date):
     return deposits.reset_index(drop=True)
 
 
-def get_out_transactions_p2p(df, from_date, include_cashout=True):
+def get_out_transactions_p2p(df, from_date, include_withdrawal=True, include_cashout=True):
     """Get outgoing transactions from P2P Statement (WITHDRAWAL + CASHOUT)"""
     if 'Type' not in df.columns:
         return pd.DataFrame()
     
     # Build filter conditions based on options
-    conditions = (df['Type'] == 'WITHDRAWAL')
+    conditions = pd.Series([False] * len(df), index=df.index)
+    
+    if include_withdrawal:
+        conditions = conditions | (df['Type'] == 'WITHDRAWAL')
     
     if include_cashout:
         conditions = conditions | (df['Type'] == 'CASHOUT')
@@ -389,224 +395,483 @@ def reconcile_transactions(card_df, p2p_df, direction='IN'):
     return results
 
 
-def create_excel_report(all_results, from_date):
-    """Create Excel report and return as bytes"""
+def create_excel_report(all_results, from_date, include_withdrawal, include_mandat, include_cashout):
+    """Create professional Excel report with summary and details"""
     wb = Workbook()
     
-    header_font = Font(bold=True, color="FFFFFF")
-    header_fill_in = PatternFill("solid", fgColor="4472C4")  # Blue for IN
-    header_fill_out = PatternFill("solid", fgColor="7030A0")  # Purple for OUT
+    # Styles
+    title_font = Font(bold=True, size=16, color="FFFFFF")
+    title_fill = PatternFill("solid", fgColor="1F4E79")
+    header_font = Font(bold=True, size=11, color="FFFFFF")
+    header_fill_blue = PatternFill("solid", fgColor="4472C4")
+    header_fill_green = PatternFill("solid", fgColor="548235")
+    header_fill_purple = PatternFill("solid", fgColor="7030A0")
+    header_fill_red = PatternFill("solid", fgColor="C00000")
     ok_fill = PatternFill("solid", fgColor="C6EFCE")
+    ok_font = Font(color="006100")
     error_fill = PatternFill("solid", fgColor="FFC7CE")
+    error_font = Font(color="9C0006")
     warning_fill = PatternFill("solid", fgColor="FFEB9C")
+    gray_fill = PatternFill("solid", fgColor="F2F2F2")
     border = Border(
         left=Side(style='thin'), right=Side(style='thin'),
         top=Side(style='thin'), bottom=Side(style='thin')
     )
     
-    # Summary sheet
-    ws_summary = wb.active
-    ws_summary.title = "Summary"
+    # ==================== SUMMARY SHEET ====================
+    ws = wb.active
+    ws.title = "RECONCILIATION REPORT"
     
-    ws_summary['A1'] = "RECONCILIATION SUMMARY - ALL CARDS"
-    ws_summary['A1'].font = Font(bold=True, size=14)
-    ws_summary.merge_cells('A1:I1')
+    # Title
+    ws.merge_cells('A1:H1')
+    ws['A1'] = "CARD RECONCILIATION REPORT"
+    ws['A1'].font = title_font
+    ws['A1'].fill = title_fill
+    ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
+    ws.row_dimensions[1].height = 30
     
-    ws_summary['A3'] = f"From Date: {from_date.strftime('%d/%m/%Y')}"
-    ws_summary['A4'] = "Rule: 1% fee removed from P2P IN amounts > 40"
+    # Report Info
+    ws['A3'] = "Report Date:"
+    ws['B3'] = datetime.now().strftime('%d/%m/%Y %H:%M')
+    ws['A4'] = "Period From:"
+    ws['B4'] = from_date.strftime('%d/%m/%Y')
+    ws['A5'] = "Options:"
+    options_text = []
+    if include_withdrawal:
+        options_text.append("Withdrawal included")
+    else:
+        options_text.append("Withdrawal excluded")
+    if include_mandat:
+        options_text.append("Mandat included")
+    else:
+        options_text.append("Mandat excluded")
+    if include_cashout:
+        options_text.append("Cashout included")
+    else:
+        options_text.append("Cashout excluded")
+    ws['B5'] = " | ".join(options_text)
     
-    # IN Summary
-    ws_summary['A6'] = "📥 IN TRANSACTIONS (Deposits)"
-    ws_summary['A6'].font = Font(bold=True, size=12, color="4472C4")
+    ws['A3'].font = Font(bold=True)
+    ws['A4'].font = Font(bold=True)
+    ws['A5'].font = Font(bold=True)
     
-    headers = ['Card', 'Card Journal', 'P2P Statement', 'Matched', 'Missing P2P', 'Missing Card', 'Missing Amount']
-    for col, header in enumerate(headers, 1):
-        cell = ws_summary.cell(row=7, column=col, value=header)
-        cell.font = header_font
-        cell.fill = header_fill_in
-        cell.border = border
+    # Rules
+    ws['A7'] = "Matching Rules:"
+    ws['A7'].font = Font(bold=True, size=11)
+    ws['A8'] = "• IN (Deposits): Match by Auth code | 1% fee removed from amounts > 40"
+    ws['A9'] = "• OUT (Withdrawals): Match by Date + Amount + Account | No fee adjustment"
     
-    row = 8
-    total_missing_in = 0
-    for card_num, results in sorted(all_results.items()):
-        if 'in' in results:
-            r = results['in']
-            summary = r['summary']
-            ws_summary.cell(row=row, column=1, value=card_num).border = border
-            ws_summary.cell(row=row, column=2, value=summary['card_count']).border = border
-            ws_summary.cell(row=row, column=3, value=summary['p2p_count']).border = border
-            ws_summary.cell(row=row, column=4, value=summary['matched']).border = border
-            
-            cell_mp = ws_summary.cell(row=row, column=5, value=summary['missing_in_p2p'])
-            cell_mp.border = border
-            if summary['missing_in_p2p'] > 0:
-                cell_mp.fill = error_fill
-            
-            cell_mc = ws_summary.cell(row=row, column=6, value=summary['missing_in_card'])
-            cell_mc.border = border
-            if summary['missing_in_card'] > 0:
-                cell_mc.fill = error_fill
-            
-            cell_ma = ws_summary.cell(row=row, column=7, value=r['missing_amount'])
-            cell_ma.border = border
-            if r['missing_amount'] > 0:
-                cell_ma.fill = error_fill
-            
-            total_missing_in += r['missing_amount']
-            row += 1
-    
-    ws_summary.cell(row=row, column=1, value="TOTAL IN").font = Font(bold=True)
-    ws_summary.cell(row=row, column=7, value=total_missing_in).font = Font(bold=True)
-    if total_missing_in > 0:
-        ws_summary.cell(row=row, column=7).fill = error_fill
-    
-    # OUT Summary
+    # ==================== SUMMARY TABLE ====================
+    row = 11
+    ws.merge_cells(f'A{row}:H{row}')
+    ws[f'A{row}'] = "📊 SUMMARY BY CARD"
+    ws[f'A{row}'].font = Font(bold=True, size=14)
+    ws[f'A{row}'].fill = gray_fill
     row += 2
-    ws_summary.cell(row=row, column=1, value="📤 OUT TRANSACTIONS (Withdrawals)")
-    ws_summary.cell(row=row, column=1).font = Font(bold=True, size=12, color="7030A0")
+    
+    # IN Summary Header
+    ws[f'A{row}'] = "📥 IN TRANSACTIONS (Deposits)"
+    ws[f'A{row}'].font = Font(bold=True, size=12, color="4472C4")
     row += 1
     
-    for col, header in enumerate(headers, 1):
-        cell = ws_summary.cell(row=row, column=col, value=header)
+    in_headers = ['Card', 'Card Journal', 'P2P Statement', 'Matched', 'Missing P2P', 'Missing Card', 'Missing Amount', 'Status']
+    for col, header in enumerate(in_headers, 1):
+        cell = ws.cell(row=row, column=col, value=header)
         cell.font = header_font
-        cell.fill = header_fill_out
+        cell.fill = header_fill_blue
         cell.border = border
+        cell.alignment = Alignment(horizontal='center')
     row += 1
     
-    total_missing_out = 0
+    total_in_missing = 0
     for card_num, results in sorted(all_results.items()):
-        if 'out' in results:
-            r = results['out']
-            summary = r['summary']
-            ws_summary.cell(row=row, column=1, value=card_num).border = border
-            ws_summary.cell(row=row, column=2, value=summary['card_count']).border = border
-            ws_summary.cell(row=row, column=3, value=summary['p2p_count']).border = border
-            ws_summary.cell(row=row, column=4, value=summary['matched']).border = border
-            
-            cell_mp = ws_summary.cell(row=row, column=5, value=summary['missing_in_p2p'])
-            cell_mp.border = border
-            if summary['missing_in_p2p'] > 0:
-                cell_mp.fill = error_fill
-            
-            cell_mc = ws_summary.cell(row=row, column=6, value=summary['missing_in_card'])
-            cell_mc.border = border
-            if summary['missing_in_card'] > 0:
-                cell_mc.fill = error_fill
-            
-            cell_ma = ws_summary.cell(row=row, column=7, value=r['missing_amount'])
-            cell_ma.border = border
-            if r['missing_amount'] > 0:
-                cell_ma.fill = error_fill
-            
-            total_missing_out += r['missing_amount']
+        r = results['in']
+        summary = r['summary']
+        
+        ws.cell(row=row, column=1, value=card_num).border = border
+        ws.cell(row=row, column=2, value=summary['card_count']).border = border
+        ws.cell(row=row, column=3, value=summary['p2p_count']).border = border
+        ws.cell(row=row, column=4, value=summary['matched']).border = border
+        
+        cell_mp = ws.cell(row=row, column=5, value=summary['missing_in_p2p'])
+        cell_mp.border = border
+        if summary['missing_in_p2p'] > 0:
+            cell_mp.fill = error_fill
+            cell_mp.font = error_font
+        
+        cell_mc = ws.cell(row=row, column=6, value=summary['missing_in_card'])
+        cell_mc.border = border
+        if summary['missing_in_card'] > 0:
+            cell_mc.fill = error_fill
+            cell_mc.font = error_font
+        
+        cell_ma = ws.cell(row=row, column=7, value=r['missing_amount'])
+        cell_ma.border = border
+        cell_ma.number_format = '#,##0.00'
+        if r['missing_amount'] > 0:
+            cell_ma.fill = error_fill
+            cell_ma.font = error_font
+        
+        # Status
+        if summary['missing_in_p2p'] == 0 and summary['missing_in_card'] == 0:
+            status_cell = ws.cell(row=row, column=8, value="✓ OK")
+            status_cell.fill = ok_fill
+            status_cell.font = ok_font
+        else:
+            status_cell = ws.cell(row=row, column=8, value="✗ Issues")
+            status_cell.fill = error_fill
+            status_cell.font = error_font
+        status_cell.border = border
+        
+        total_in_missing += r['missing_amount']
+        row += 1
+    
+    # IN Total row
+    ws.cell(row=row, column=1, value="TOTAL IN").font = Font(bold=True)
+    ws.cell(row=row, column=7, value=total_in_missing).font = Font(bold=True)
+    ws.cell(row=row, column=7).number_format = '#,##0.00'
+    if total_in_missing > 0:
+        ws.cell(row=row, column=7).fill = error_fill
+    row += 2
+    
+    # OUT Summary Header
+    ws[f'A{row}'] = "📤 OUT TRANSACTIONS (Withdrawals/Cashouts)"
+    ws[f'A{row}'].font = Font(bold=True, size=12, color="7030A0")
+    row += 1
+    
+    out_headers = ['Card', 'Card Journal', 'P2P Statement', 'Matched', 'Missing P2P', 'Missing Card', 'Missing Amount', 'Status']
+    for col, header in enumerate(out_headers, 1):
+        cell = ws.cell(row=row, column=col, value=header)
+        cell.font = header_font
+        cell.fill = header_fill_purple
+        cell.border = border
+        cell.alignment = Alignment(horizontal='center')
+    row += 1
+    
+    total_out_missing = 0
+    for card_num, results in sorted(all_results.items()):
+        r = results['out']
+        summary = r['summary']
+        
+        ws.cell(row=row, column=1, value=card_num).border = border
+        ws.cell(row=row, column=2, value=summary['card_count']).border = border
+        ws.cell(row=row, column=3, value=summary['p2p_count']).border = border
+        ws.cell(row=row, column=4, value=summary['matched']).border = border
+        
+        cell_mp = ws.cell(row=row, column=5, value=summary['missing_in_p2p'])
+        cell_mp.border = border
+        if summary['missing_in_p2p'] > 0:
+            cell_mp.fill = error_fill
+            cell_mp.font = error_font
+        
+        cell_mc = ws.cell(row=row, column=6, value=summary['missing_in_card'])
+        cell_mc.border = border
+        if summary['missing_in_card'] > 0:
+            cell_mc.fill = error_fill
+            cell_mc.font = error_font
+        
+        cell_ma = ws.cell(row=row, column=7, value=r['missing_amount'])
+        cell_ma.border = border
+        cell_ma.number_format = '#,##0.00'
+        if r['missing_amount'] > 0:
+            cell_ma.fill = error_fill
+            cell_ma.font = error_font
+        
+        # Status
+        if summary['missing_in_p2p'] == 0 and summary['missing_in_card'] == 0:
+            status_cell = ws.cell(row=row, column=8, value="✓ OK")
+            status_cell.fill = ok_fill
+            status_cell.font = ok_font
+        else:
+            status_cell = ws.cell(row=row, column=8, value="✗ Issues")
+            status_cell.fill = error_fill
+            status_cell.font = error_font
+        status_cell.border = border
+        
+        total_out_missing += r['missing_amount']
+        row += 1
+    
+    # OUT Total row
+    ws.cell(row=row, column=1, value="TOTAL OUT").font = Font(bold=True)
+    ws.cell(row=row, column=7, value=total_out_missing).font = Font(bold=True)
+    ws.cell(row=row, column=7).number_format = '#,##0.00'
+    if total_out_missing > 0:
+        ws.cell(row=row, column=7).fill = error_fill
+    row += 2
+    
+    # Grand Total
+    ws.merge_cells(f'A{row}:F{row}')
+    ws[f'A{row}'] = "⚠️ TOTAL MISSING AMOUNT (IN + OUT):"
+    ws[f'A{row}'].font = Font(bold=True, size=12)
+    ws.cell(row=row, column=7, value=total_in_missing + total_out_missing)
+    ws.cell(row=row, column=7).font = Font(bold=True, size=12)
+    ws.cell(row=row, column=7).number_format = '#,##0.00'
+    if (total_in_missing + total_out_missing) > 0:
+        ws.cell(row=row, column=7).fill = error_fill
+    
+    # Column widths
+    ws.column_dimensions['A'].width = 12
+    ws.column_dimensions['B'].width = 14
+    ws.column_dimensions['C'].width = 14
+    ws.column_dimensions['D'].width = 12
+    ws.column_dimensions['E'].width = 14
+    ws.column_dimensions['F'].width = 14
+    ws.column_dimensions['G'].width = 16
+    ws.column_dimensions['H'].width = 12
+    
+    # ==================== DETAIL SHEETS PER CARD ====================
+    for card_num, results in sorted(all_results.items()):
+        ws_card = wb.create_sheet(f"Card {card_num}")
+        
+        # Title
+        ws_card.merge_cells('A1:H1')
+        ws_card[f'A1'] = f"CARD {card_num} - RECONCILIATION DETAILS"
+        ws_card['A1'].font = title_font
+        ws_card['A1'].fill = title_fill
+        ws_card['A1'].alignment = Alignment(horizontal='center', vertical='center')
+        ws_card.row_dimensions[1].height = 30
+        
+        row = 3
+        
+        # ===== IN SECTION =====
+        ws_card.merge_cells(f'A{row}:H{row}')
+        ws_card[f'A{row}'] = "📥 IN TRANSACTIONS (Deposits)"
+        ws_card[f'A{row}'].font = Font(bold=True, size=14, color="4472C4")
+        ws_card[f'A{row}'].fill = gray_fill
+        row += 2
+        
+        r_in = results['in']
+        
+        # IN Summary
+        ws_card[f'A{row}'] = "Card Journal:"
+        ws_card[f'B{row}'] = r_in['summary']['card_count']
+        ws_card[f'C{row}'] = "P2P Statement:"
+        ws_card[f'D{row}'] = r_in['summary']['p2p_count']
+        ws_card[f'E{row}'] = "Matched:"
+        ws_card[f'F{row}'] = r_in['summary']['matched']
+        ws_card[f'A{row}'].font = Font(bold=True)
+        ws_card[f'C{row}'].font = Font(bold=True)
+        ws_card[f'E{row}'].font = Font(bold=True)
+        row += 2
+        
+        # Missing in P2P
+        if r_in['missing_in_p2p']:
+            ws_card[f'A{row}'] = "❌ MISSING IN P2P STATEMENT"
+            ws_card[f'A{row}'].font = Font(bold=True, size=11, color="C00000")
             row += 1
-    
-    ws_summary.cell(row=row, column=1, value="TOTAL OUT").font = Font(bold=True)
-    ws_summary.cell(row=row, column=7, value=total_missing_out).font = Font(bold=True)
-    if total_missing_out > 0:
-        ws_summary.cell(row=row, column=7).fill = error_fill
-    
-    for col in range(1, 8):
-        ws_summary.column_dimensions[chr(64 + col)].width = 18
-    
-    # Detail sheets per card
-    for card_num, results in sorted(all_results.items()):
-        for direction, label, header_fill in [('in', 'IN', header_fill_in), ('out', 'OUT', header_fill_out)]:
-            if direction not in results:
-                continue
             
-            r = results[direction]
-            if r['summary']['card_count'] == 0 and r['summary']['p2p_count'] == 0:
-                continue
-            
-            ws = wb.create_sheet(f"Card {card_num} {label}")
-            
-            ws['A1'] = f"CARD {card_num} - {label} TRANSACTIONS"
-            ws['A1'].font = Font(bold=True, size=12)
-            ws.merge_cells('A1:H1')
-            
-            headers = ['Auth', 'Date', 'P2P Amt', 'Adjusted Amt', 'Card Amt', 'Diff', 'Status', 'Fee']
+            headers = ['Auth', 'Date', 'Time', 'Amount', 'Description']
             for col, header in enumerate(headers, 1):
-                cell = ws.cell(row=3, column=col, value=header)
+                cell = ws_card.cell(row=row, column=col, value=header)
                 cell.font = header_font
-                cell.fill = header_fill
+                cell.fill = header_fill_red
                 cell.border = border
+            row += 1
             
-            row = 4
-            for item in r['matched_details']:
-                ws.cell(row=row, column=1, value=item['Auth']).border = border
-                ws.cell(row=row, column=2, value=item['Date']).border = border
-                ws.cell(row=row, column=3, value=item['P2P_Amount']).border = border
-                ws.cell(row=row, column=4, value=item['Adjusted_Amount']).border = border
-                ws.cell(row=row, column=5, value=item['Card_Amount']).border = border
-                ws.cell(row=row, column=6, value=item['Difference']).border = border
+            for item in r_in['missing_in_p2p']:
+                ws_card.cell(row=row, column=1, value=item['Auth']).border = border
+                ws_card.cell(row=row, column=2, value=item['Date']).border = border
+                ws_card.cell(row=row, column=3, value=item['Time']).border = border
+                cell_amt = ws_card.cell(row=row, column=4, value=item['Amount'])
+                cell_amt.border = border
+                cell_amt.number_format = '#,##0.00'
+                ws_card.cell(row=row, column=5, value=item['Description']).border = border
+                for c in range(1, 6):
+                    ws_card.cell(row=row, column=c).fill = error_fill
+                row += 1
+            
+            ws_card[f'A{row}'] = "Total Missing:"
+            ws_card[f'A{row}'].font = Font(bold=True)
+            ws_card.cell(row=row, column=4, value=r_in['missing_amount'])
+            ws_card.cell(row=row, column=4).font = Font(bold=True)
+            ws_card.cell(row=row, column=4).number_format = '#,##0.00'
+            row += 2
+        
+        # Missing in Card
+        if r_in['missing_in_card']:
+            ws_card[f'A{row}'] = "❌ MISSING IN CARD JOURNAL"
+            ws_card[f'A{row}'].font = Font(bold=True, size=11, color="C00000")
+            row += 1
+            
+            headers = ['Auth', 'Date', 'Time', 'Amount', 'Type']
+            for col, header in enumerate(headers, 1):
+                cell = ws_card.cell(row=row, column=col, value=header)
+                cell.font = header_font
+                cell.fill = header_fill_red
+                cell.border = border
+            row += 1
+            
+            for item in r_in['missing_in_card']:
+                ws_card.cell(row=row, column=1, value=item['Auth']).border = border
+                ws_card.cell(row=row, column=2, value=item['Date']).border = border
+                ws_card.cell(row=row, column=3, value=item['Time']).border = border
+                cell_amt = ws_card.cell(row=row, column=4, value=item['Amount'])
+                cell_amt.border = border
+                cell_amt.number_format = '#,##0.00'
+                ws_card.cell(row=row, column=5, value=item.get('Type', '-')).border = border
+                for c in range(1, 6):
+                    ws_card.cell(row=row, column=c).fill = error_fill
+                row += 1
+            row += 1
+        
+        # Matched IN
+        if r_in['matched_details']:
+            ws_card[f'A{row}'] = "✓ MATCHED TRANSACTIONS"
+            ws_card[f'A{row}'].font = Font(bold=True, size=11, color="006100")
+            row += 1
+            
+            headers = ['Auth', 'Date', 'P2P Amount', 'Adjusted', 'Card Amount', 'Diff', 'Status', 'Fee']
+            for col, header in enumerate(headers, 1):
+                cell = ws_card.cell(row=row, column=col, value=header)
+                cell.font = header_font
+                cell.fill = header_fill_green
+                cell.border = border
+            row += 1
+            
+            for item in r_in['matched_details']:
+                ws_card.cell(row=row, column=1, value=item['Auth']).border = border
+                ws_card.cell(row=row, column=2, value=item['Date']).border = border
+                ws_card.cell(row=row, column=3, value=item['P2P_Amount']).border = border
+                ws_card.cell(row=row, column=4, value=item['Adjusted_Amount']).border = border
+                ws_card.cell(row=row, column=5, value=item['Card_Amount']).border = border
+                ws_card.cell(row=row, column=6, value=item['Difference']).border = border
                 
-                status_cell = ws.cell(row=row, column=7, value=item['Status'])
+                status_cell = ws_card.cell(row=row, column=7, value=item['Status'])
                 status_cell.border = border
-                status_cell.fill = ok_fill if item['Status'] == 'OK' else warning_fill
+                if item['Status'] == 'OK':
+                    status_cell.fill = ok_fill
+                    status_cell.font = ok_font
+                else:
+                    status_cell.fill = warning_fill
                 
-                ws.cell(row=row, column=8, value=item['Fee_Applied']).border = border
+                ws_card.cell(row=row, column=8, value=item['Fee_Applied']).border = border
+                row += 1
+            row += 1
+        
+        row += 1
+        
+        # ===== OUT SECTION =====
+        ws_card.merge_cells(f'A{row}:H{row}')
+        ws_card[f'A{row}'] = "📤 OUT TRANSACTIONS (Withdrawals/Cashouts)"
+        ws_card[f'A{row}'].font = Font(bold=True, size=14, color="7030A0")
+        ws_card[f'A{row}'].fill = gray_fill
+        row += 2
+        
+        r_out = results['out']
+        
+        # OUT Summary
+        ws_card[f'A{row}'] = "Card Journal:"
+        ws_card[f'B{row}'] = r_out['summary']['card_count']
+        ws_card[f'C{row}'] = "P2P Statement:"
+        ws_card[f'D{row}'] = r_out['summary']['p2p_count']
+        ws_card[f'E{row}'] = "Matched:"
+        ws_card[f'F{row}'] = r_out['summary']['matched']
+        ws_card[f'A{row}'].font = Font(bold=True)
+        ws_card[f'C{row}'].font = Font(bold=True)
+        ws_card[f'E{row}'].font = Font(bold=True)
+        row += 2
+        
+        # Missing in P2P
+        if r_out['missing_in_p2p']:
+            ws_card[f'A{row}'] = "❌ MISSING IN P2P STATEMENT"
+            ws_card[f'A{row}'].font = Font(bold=True, size=11, color="C00000")
+            row += 1
+            
+            headers = ['Account', 'Date', 'Time', 'Amount', 'Description']
+            for col, header in enumerate(headers, 1):
+                cell = ws_card.cell(row=row, column=col, value=header)
+                cell.font = header_font
+                cell.fill = header_fill_red
+                cell.border = border
+            row += 1
+            
+            for item in r_out['missing_in_p2p']:
+                ws_card.cell(row=row, column=1, value=item['Auth']).border = border
+                ws_card.cell(row=row, column=2, value=item['Date']).border = border
+                ws_card.cell(row=row, column=3, value=item['Time']).border = border
+                cell_amt = ws_card.cell(row=row, column=4, value=item['Amount'])
+                cell_amt.border = border
+                cell_amt.number_format = '#,##0.00'
+                ws_card.cell(row=row, column=5, value=item['Description']).border = border
+                for c in range(1, 6):
+                    ws_card.cell(row=row, column=c).fill = error_fill
                 row += 1
             
-            # Missing in P2P section
-            if r['missing_in_p2p']:
-                row += 2
-                ws.cell(row=row, column=1, value="❌ MISSING IN P2P STATEMENT")
-                ws.cell(row=row, column=1).font = Font(bold=True, color="FF0000", size=11)
-                ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
-                row += 1
-                
-                missing_headers = ['Auth', 'Date', 'Time', 'Amount', 'Description']
-                for col, header in enumerate(missing_headers, 1):
-                    cell = ws.cell(row=row, column=col, value=header)
-                    cell.font = Font(bold=True, color="FFFFFF")
-                    cell.fill = PatternFill("solid", fgColor="C00000")
-                    cell.border = border
-                row += 1
-                
-                for item in r['missing_in_p2p']:
-                    ws.cell(row=row, column=1, value=item['Auth']).border = border
-                    ws.cell(row=row, column=2, value=item['Date']).border = border
-                    ws.cell(row=row, column=3, value=item['Time']).border = border
-                    ws.cell(row=row, column=4, value=item['Amount']).border = border
-                    ws.cell(row=row, column=5, value=item['Description']).border = border
-                    for c in range(1, 6):
-                        ws.cell(row=row, column=c).fill = error_fill
-                    row += 1
+            ws_card[f'A{row}'] = "Total Missing:"
+            ws_card[f'A{row}'].font = Font(bold=True)
+            ws_card.cell(row=row, column=4, value=r_out['missing_amount'])
+            ws_card.cell(row=row, column=4).font = Font(bold=True)
+            ws_card.cell(row=row, column=4).number_format = '#,##0.00'
+            row += 2
+        
+        # Missing in Card
+        if r_out['missing_in_card']:
+            ws_card[f'A{row}'] = "❌ MISSING IN CARD JOURNAL"
+            ws_card[f'A{row}'].font = Font(bold=True, size=11, color="C00000")
+            row += 1
             
-            # Missing in Card section
-            if r['missing_in_card']:
-                row += 2
-                ws.cell(row=row, column=1, value="❌ MISSING IN CARD JOURNAL")
-                ws.cell(row=row, column=1).font = Font(bold=True, color="FF0000", size=11)
-                ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
-                row += 1
-                
-                missing_headers = ['Auth', 'Date', 'Time', 'Amount']
-                for col, header in enumerate(missing_headers, 1):
-                    cell = ws.cell(row=row, column=col, value=header)
-                    cell.font = Font(bold=True, color="FFFFFF")
-                    cell.fill = PatternFill("solid", fgColor="C00000")
-                    cell.border = border
-                row += 1
-                
-                for item in r['missing_in_card']:
-                    ws.cell(row=row, column=1, value=item['Auth']).border = border
-                    ws.cell(row=row, column=2, value=item['Date']).border = border
-                    ws.cell(row=row, column=3, value=item['Time']).border = border
-                    ws.cell(row=row, column=4, value=item['Amount']).border = border
-                    for c in range(1, 5):
-                        ws.cell(row=row, column=c).fill = error_fill
-                    row += 1
+            headers = ['Account', 'Date', 'Time', 'Amount', 'Type']
+            for col, header in enumerate(headers, 1):
+                cell = ws_card.cell(row=row, column=col, value=header)
+                cell.font = header_font
+                cell.fill = header_fill_red
+                cell.border = border
+            row += 1
             
-            ws.column_dimensions['A'].width = 12
-            ws.column_dimensions['B'].width = 12
-            ws.column_dimensions['C'].width = 12
-            ws.column_dimensions['D'].width = 14
-            ws.column_dimensions['E'].width = 12
-            ws.column_dimensions['F'].width = 10
-            ws.column_dimensions['G'].width = 10
-            ws.column_dimensions['H'].width = 8
+            for item in r_out['missing_in_card']:
+                ws_card.cell(row=row, column=1, value=item['Auth']).border = border
+                ws_card.cell(row=row, column=2, value=item['Date']).border = border
+                ws_card.cell(row=row, column=3, value=item['Time']).border = border
+                cell_amt = ws_card.cell(row=row, column=4, value=item['Amount'])
+                cell_amt.border = border
+                cell_amt.number_format = '#,##0.00'
+                ws_card.cell(row=row, column=5, value=item.get('Type', '-')).border = border
+                for c in range(1, 6):
+                    ws_card.cell(row=row, column=c).fill = error_fill
+                row += 1
+            row += 1
+        
+        # Matched OUT
+        if r_out['matched_details']:
+            ws_card[f'A{row}'] = "✓ MATCHED TRANSACTIONS"
+            ws_card[f'A{row}'].font = Font(bold=True, size=11, color="006100")
+            row += 1
+            
+            headers = ['Account', 'Date', 'P2P Amount', 'Adjusted', 'Card Amount', 'Diff', 'Status']
+            for col, header in enumerate(headers, 1):
+                cell = ws_card.cell(row=row, column=col, value=header)
+                cell.font = header_font
+                cell.fill = header_fill_green
+                cell.border = border
+            row += 1
+            
+            for item in r_out['matched_details']:
+                ws_card.cell(row=row, column=1, value=item['Auth']).border = border
+                ws_card.cell(row=row, column=2, value=item['Date']).border = border
+                ws_card.cell(row=row, column=3, value=item['P2P_Amount']).border = border
+                ws_card.cell(row=row, column=4, value=item['Adjusted_Amount']).border = border
+                ws_card.cell(row=row, column=5, value=item['Card_Amount']).border = border
+                ws_card.cell(row=row, column=6, value=item['Difference']).border = border
+                
+                status_cell = ws_card.cell(row=row, column=7, value=item['Status'])
+                status_cell.border = border
+                if item['Status'] == 'OK':
+                    status_cell.fill = ok_fill
+                    status_cell.font = ok_font
+                else:
+                    status_cell.fill = warning_fill
+                
+                row += 1
+        
+        # Column widths for card sheet
+        ws_card.column_dimensions['A'].width = 14
+        ws_card.column_dimensions['B'].width = 12
+        ws_card.column_dimensions['C'].width = 14
+        ws_card.column_dimensions['D'].width = 12
+        ws_card.column_dimensions['E'].width = 14
+        ws_card.column_dimensions['F'].width = 10
+        ws_card.column_dimensions['G'].width = 10
+        ws_card.column_dimensions['H'].width = 35
     
     # Save to bytes
     output = BytesIO()
@@ -622,8 +887,8 @@ st.markdown('<div class="sub-header">Compare Card Journal vs P2P Statement</div>
 st.info("""
 **Rules:**
 - 📥 **IN (Deposits):** Match by Auth code | 1% fee removed from P2P amounts > 40
-- 📤 **OUT (Withdrawals):** Match by Date + Amount + Account | No fee adjustment
-- Use checkboxes below to include/exclude Mandat and Cashout from OUT reconciliation
+- 📤 **OUT:** Match by Date + Amount + Account | No fee adjustment
+- Use checkboxes to include/exclude: Withdrawal (Transfert vers), Mandat, Cashout
 """)
 
 # File upload section
@@ -665,10 +930,12 @@ with col_date:
 
 with col_options:
     st.markdown("**OUT Transaction Options:**")
-    col_opt1, col_opt2 = st.columns(2)
+    col_opt1, col_opt2, col_opt3 = st.columns(3)
     with col_opt1:
-        include_mandat = st.checkbox("Include Mandat", value=True)
+        include_withdrawal = st.checkbox("Include Withdrawal", value=True)
     with col_opt2:
+        include_mandat = st.checkbox("Include Mandat", value=True)
+    with col_opt3:
         include_cashout = st.checkbox("Include Cashout", value=True)
 
 # Process files
@@ -732,8 +999,8 @@ if card_files and p2p_files:
                         results_in = reconcile_transactions(card_in, p2p_in, 'IN')
                         
                         # Get OUT transactions
-                        card_out = get_out_transactions_card(card_df, from_date_dt, include_mandat, include_cashout)
-                        p2p_out = get_out_transactions_p2p(p2p_df, from_date_dt, include_cashout)
+                        card_out = get_out_transactions_card(card_df, from_date_dt, include_withdrawal, include_mandat)
+                        p2p_out = get_out_transactions_p2p(p2p_df, from_date_dt, include_withdrawal, include_cashout)
                         results_out = reconcile_transactions(card_out, p2p_out, 'OUT')
                         
                         all_results[card_num] = {
@@ -744,67 +1011,191 @@ if card_files and p2p_files:
                         st.error(f"Error processing card {card_num}: {e}")
             
             if all_results:
-                # Show results
+                # ==================== RECONCILIATION REPORT ====================
                 st.markdown("---")
-                st.subheader("📊 Results")
                 
-                # IN Summary
+                # Header
+                st.markdown("## 📊 RECONCILIATION REPORT")
+                st.markdown(f"**Generated:** {datetime.now().strftime('%d/%m/%Y %H:%M')} | **Period From:** {from_date.strftime('%d/%m/%Y')}")
+                
+                # Options used
+                options_text = []
+                if include_withdrawal:
+                    options_text.append("✓ Withdrawal")
+                else:
+                    options_text.append("✗ Withdrawal")
+                if include_mandat:
+                    options_text.append("✓ Mandat")
+                else:
+                    options_text.append("✗ Mandat")
+                if include_cashout:
+                    options_text.append("✓ Cashout")
+                else:
+                    options_text.append("✗ Cashout")
+                st.caption(f"OUT Options: {' | '.join(options_text)}")
+                
+                # Calculate totals
+                total_cards = len(all_results)
+                total_in_matched = sum(r['in']['summary']['matched'] for r in all_results.values())
+                total_in_missing_p2p = sum(r['in']['summary']['missing_in_p2p'] for r in all_results.values())
+                total_in_missing_card = sum(r['in']['summary']['missing_in_card'] for r in all_results.values())
+                total_in_missing_amount = sum(r['in']['missing_amount'] for r in all_results.values())
+                
+                total_out_matched = sum(r['out']['summary']['matched'] for r in all_results.values())
+                total_out_missing_p2p = sum(r['out']['summary']['missing_in_p2p'] for r in all_results.values())
+                total_out_missing_card = sum(r['out']['summary']['missing_in_card'] for r in all_results.values())
+                total_out_missing_amount = sum(r['out']['missing_amount'] for r in all_results.values())
+                
+                total_missing = total_in_missing_amount + total_out_missing_amount
+                
+                # Overall Status
+                st.markdown("### 🎯 Overall Status")
+                if total_in_missing_p2p == 0 and total_in_missing_card == 0 and total_out_missing_p2p == 0 and total_out_missing_card == 0:
+                    st.success("✅ **ALL TRANSACTIONS MATCHED** - No discrepancies found!")
+                else:
+                    st.error(f"⚠️ **DISCREPANCIES FOUND** - Total Missing Amount: **{total_missing:.2f}**")
+                
+                # Summary metrics
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("📇 Cards Processed", total_cards)
+                with col2:
+                    delta_in = f"-{total_in_missing_p2p + total_in_missing_card}" if (total_in_missing_p2p + total_in_missing_card) > 0 else None
+                    st.metric("📥 IN Matched", total_in_matched, delta=delta_in, delta_color="inverse")
+                with col3:
+                    delta_out = f"-{total_out_missing_p2p + total_out_missing_card}" if (total_out_missing_p2p + total_out_missing_card) > 0 else None
+                    st.metric("📤 OUT Matched", total_out_matched, delta=delta_out, delta_color="inverse")
+                with col4:
+                    st.metric("💰 Missing Amount", f"{total_missing:.2f}")
+                
+                st.markdown("---")
+                
+                # ==================== IN TRANSACTIONS SUMMARY ====================
                 st.markdown("### 📥 IN Transactions (Deposits)")
                 in_data = []
                 for card_num, results in sorted(all_results.items()):
                     r = results['in']
                     summary = r['summary']
+                    status = "✅" if summary['missing_in_p2p'] == 0 and summary['missing_in_card'] == 0 else "❌"
                     in_data.append({
+                        'Status': status,
                         'Card': card_num,
                         'Card Journal': summary['card_count'],
                         'P2P Statement': summary['p2p_count'],
                         'Matched': summary['matched'],
                         'Missing (P2P)': summary['missing_in_p2p'],
                         'Missing (Card)': summary['missing_in_card'],
-                        'Missing Amount': r['missing_amount']
+                        'Missing Amount': f"{r['missing_amount']:.2f}" if r['missing_amount'] > 0 else "-"
                     })
                 
                 df_in = pd.DataFrame(in_data)
                 st.dataframe(df_in, use_container_width=True, hide_index=True)
                 
-                total_missing_in = sum(r['in']['missing_amount'] for r in all_results.values())
-                if total_missing_in > 0:
-                    st.error(f"⚠️ Total Missing IN Amount: **{total_missing_in:.2f}**")
+                if total_in_missing_amount > 0:
+                    st.error(f"⚠️ Total IN Missing: **{total_in_missing_amount:.2f}**")
                 else:
                     st.success("✅ All IN transactions matched!")
                 
-                # OUT Summary
+                # ==================== OUT TRANSACTIONS SUMMARY ====================
                 st.markdown("### 📤 OUT Transactions (Withdrawals)")
                 out_data = []
                 for card_num, results in sorted(all_results.items()):
                     r = results['out']
                     summary = r['summary']
+                    status = "✅" if summary['missing_in_p2p'] == 0 and summary['missing_in_card'] == 0 else "❌"
                     out_data.append({
+                        'Status': status,
                         'Card': card_num,
                         'Card Journal': summary['card_count'],
                         'P2P Statement': summary['p2p_count'],
                         'Matched': summary['matched'],
                         'Missing (P2P)': summary['missing_in_p2p'],
                         'Missing (Card)': summary['missing_in_card'],
-                        'Missing Amount': r['missing_amount']
+                        'Missing Amount': f"{r['missing_amount']:.2f}" if r['missing_amount'] > 0 else "-"
                     })
                 
                 df_out = pd.DataFrame(out_data)
                 st.dataframe(df_out, use_container_width=True, hide_index=True)
                 
-                total_missing_out = sum(r['out']['missing_amount'] for r in all_results.values())
-                if total_missing_out > 0:
-                    st.error(f"⚠️ Total Missing OUT Amount: **{total_missing_out:.2f}**")
+                if total_out_missing_amount > 0:
+                    st.error(f"⚠️ Total OUT Missing: **{total_out_missing_amount:.2f}**")
                 else:
                     st.success("✅ All OUT transactions matched!")
                 
-                # Details per card
+                # ==================== MISSING TRANSACTIONS DETAIL ====================
+                # Collect all missing transactions
+                all_missing_in_p2p = []
+                all_missing_in_card = []
+                all_missing_out_p2p = []
+                all_missing_out_card = []
+                
                 for card_num, results in sorted(all_results.items()):
-                    with st.expander(f"📋 Card {card_num} Details"):
+                    for item in results['in']['missing_in_p2p']:
+                        item_copy = item.copy()
+                        item_copy['Card'] = card_num
+                        all_missing_in_p2p.append(item_copy)
+                    for item in results['in']['missing_in_card']:
+                        item_copy = item.copy()
+                        item_copy['Card'] = card_num
+                        all_missing_in_card.append(item_copy)
+                    for item in results['out']['missing_in_p2p']:
+                        item_copy = item.copy()
+                        item_copy['Card'] = card_num
+                        all_missing_out_p2p.append(item_copy)
+                    for item in results['out']['missing_in_card']:
+                        item_copy = item.copy()
+                        item_copy['Card'] = card_num
+                        all_missing_out_card.append(item_copy)
+                
+                if all_missing_in_p2p or all_missing_in_card or all_missing_out_p2p or all_missing_out_card:
+                    st.markdown("---")
+                    st.markdown("### ❌ MISSING TRANSACTIONS DETAIL")
+                    
+                    if all_missing_in_p2p:
+                        st.markdown("#### 📥 IN - Missing in P2P Statement")
+                        df = pd.DataFrame(all_missing_in_p2p)
+                        cols = ['Card'] + [c for c in df.columns if c != 'Card']
+                        st.dataframe(df[cols], use_container_width=True, hide_index=True)
+                    
+                    if all_missing_in_card:
+                        st.markdown("#### 📥 IN - Missing in Card Journal")
+                        df = pd.DataFrame(all_missing_in_card)
+                        cols = ['Card'] + [c for c in df.columns if c != 'Card']
+                        st.dataframe(df[cols], use_container_width=True, hide_index=True)
+                    
+                    if all_missing_out_p2p:
+                        st.markdown("#### 📤 OUT - Missing in P2P Statement")
+                        df = pd.DataFrame(all_missing_out_p2p)
+                        cols = ['Card'] + [c for c in df.columns if c != 'Card']
+                        st.dataframe(df[cols], use_container_width=True, hide_index=True)
+                    
+                    if all_missing_out_card:
+                        st.markdown("#### 📤 OUT - Missing in Card Journal")
+                        df = pd.DataFrame(all_missing_out_card)
+                        cols = ['Card'] + [c for c in df.columns if c != 'Card']
+                        st.dataframe(df[cols], use_container_width=True, hide_index=True)
+                
+                # ==================== CARD DETAILS (Expandable) ====================
+                st.markdown("---")
+                st.markdown("### 📋 Detailed View by Card")
+                
+                for card_num, results in sorted(all_results.items()):
+                    in_status = "✅" if results['in']['summary']['missing_in_p2p'] == 0 and results['in']['summary']['missing_in_card'] == 0 else "❌"
+                    out_status = "✅" if results['out']['summary']['missing_in_p2p'] == 0 and results['out']['summary']['missing_in_card'] == 0 else "❌"
+                    
+                    with st.expander(f"Card {card_num} | IN: {in_status} ({results['in']['summary']['matched']} matched) | OUT: {out_status} ({results['out']['summary']['matched']} matched)"):
                         tab_in, tab_out = st.tabs(["📥 IN", "📤 OUT"])
                         
                         with tab_in:
                             r = results['in']
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Matched", r['summary']['matched'])
+                            with col2:
+                                st.metric("Missing P2P", r['summary']['missing_in_p2p'])
+                            with col3:
+                                st.metric("Missing Card", r['summary']['missing_in_card'])
+                            
                             if r['missing_in_p2p']:
                                 st.markdown("**❌ Missing in P2P Statement:**")
                                 st.dataframe(pd.DataFrame(r['missing_in_p2p']), use_container_width=True, hide_index=True)
@@ -814,11 +1205,19 @@ if card_files and p2p_files:
                                 st.dataframe(pd.DataFrame(r['missing_in_card']), use_container_width=True, hide_index=True)
                             
                             if r['matched_details']:
-                                st.markdown("**✅ Matched:**")
+                                st.markdown("**✅ Matched Transactions:**")
                                 st.dataframe(pd.DataFrame(r['matched_details']), use_container_width=True, hide_index=True)
                         
                         with tab_out:
                             r = results['out']
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Matched", r['summary']['matched'])
+                            with col2:
+                                st.metric("Missing P2P", r['summary']['missing_in_p2p'])
+                            with col3:
+                                st.metric("Missing Card", r['summary']['missing_in_card'])
+                            
                             if r['missing_in_p2p']:
                                 st.markdown("**❌ Missing in P2P Statement:**")
                                 st.dataframe(pd.DataFrame(r['missing_in_p2p']), use_container_width=True, hide_index=True)
@@ -828,12 +1227,12 @@ if card_files and p2p_files:
                                 st.dataframe(pd.DataFrame(r['missing_in_card']), use_container_width=True, hide_index=True)
                             
                             if r['matched_details']:
-                                st.markdown("**✅ Matched:**")
+                                st.markdown("**✅ Matched Transactions:**")
                                 st.dataframe(pd.DataFrame(r['matched_details']), use_container_width=True, hide_index=True)
                 
-                # Download Excel report
+                # ==================== DOWNLOAD REPORT ====================
                 st.markdown("---")
-                excel_file = create_excel_report(all_results, from_date_dt)
+                excel_file = create_excel_report(all_results, from_date_dt, include_withdrawal, include_mandat, include_cashout)
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 
                 st.download_button(
@@ -841,7 +1240,8 @@ if card_files and p2p_files:
                     data=excel_file,
                     file_name=f"recon_report_{timestamp}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
+                    use_container_width=True,
+                    type="primary"
                 )
     else:
         st.warning("⚠️ No matching card pairs found. Make sure you have both Card Journal and P2P Statement files for at least one card.")
@@ -857,4 +1257,4 @@ else:
 
 # Footer
 st.markdown("---")
-st.caption("Card Reconciliation Tool v2.6 | Optional Mandat/Cashout | IN: Auth match | OUT: Date+Amount+Account match")
+st.caption("Card Reconciliation Tool v2.8 | Withdrawal/Mandat/Cashout Options")
