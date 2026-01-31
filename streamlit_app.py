@@ -59,16 +59,25 @@ st.markdown("""
 
 # ============== FUNCTIONS ==============
 def extract_card_number(filename):
-    """Extract card number from filename"""
-    # Card Journal pattern: starts with card number like "178-D17-"
-    card_match = re.match(r'^(\d+)-D17-', filename, re.IGNORECASE)
-    if card_match:
-        return card_match.group(1), 'card_journal'
+    """Extract card number from filename - flexible matching"""
+    filename_lower = filename.lower()
     
-    # P2P Statement pattern: contains "d17-XXX-"
-    p2p_match = re.search(r'd17-(\d+)-', filename, re.IGNORECASE)
-    if p2p_match:
-        return p2p_match.group(1), 'p2p_statement'
+    # Pattern 1: Starts with number like "308-d17" or "075-D17"
+    match1 = re.match(r'^(\d+)-d17', filename_lower)
+    if match1:
+        # Remove leading zeros for consistent matching
+        return str(int(match1.group(1))), 'card_journal'
+    
+    # Pattern 2: Contains "d17-XXX-" like "statement-d17-308-xxx"
+    match2 = re.search(r'd17-(\d+)-', filename_lower)
+    if match2:
+        # Remove leading zeros for consistent matching
+        return str(int(match2.group(1))), 'p2p_statement'
+    
+    # Pattern 3: Any number followed by -d17 anywhere in filename
+    match3 = re.search(r'(\d+)-d17', filename_lower)
+    if match3:
+        return str(int(match3.group(1))), 'card_journal'
     
     return None, None
 
@@ -121,39 +130,60 @@ def load_p2p_statement(file):
 def get_in_transactions_card(df, from_date):
     """Get incoming transactions from Card Journal (Transfert du)"""
     filtered = df[df['DATE'] >= from_date].copy()
-    if 'LIBELLE' in filtered.columns:
-        incoming = filtered[filtered['LIBELLE'].str.contains('Transfert du', case=False, na=False)].copy()
-        incoming = incoming[incoming['MONTANT'] > 0].copy()
-        incoming['Auth'] = incoming['Auth'].astype(str)
-        return incoming.reset_index(drop=True)
-    return pd.DataFrame()
+    if 'LIBELLE' not in filtered.columns or filtered.empty:
+        return pd.DataFrame()
+    
+    incoming = filtered[filtered['LIBELLE'].str.contains('Transfert du', case=False, na=False)].copy()
+    
+    if incoming.empty:
+        return pd.DataFrame()
+    
+    incoming = incoming[incoming['MONTANT'] > 0].copy()
+    
+    if incoming.empty:
+        return pd.DataFrame()
+    
+    incoming['Auth'] = incoming['Auth'].astype(str)
+    return incoming.reset_index(drop=True)
 
 
 def get_out_transactions_card(df, from_date):
     """Get outgoing transactions from Card Journal (Transfert vers + Mandat)"""
     filtered = df[df['DATE'] >= from_date].copy()
-    if 'LIBELLE' in filtered.columns:
-        # Include both "Transfert vers" and "Mandat"
-        outgoing = filtered[
-            filtered['LIBELLE'].str.contains('Transfert vers', case=False, na=False) |
-            filtered['LIBELLE'].str.contains('Mandat', case=False, na=False)
-        ].copy()
-        outgoing['MONTANT'] = outgoing['MONTANT'].abs()  # Make positive for comparison
-        
-        # Extract account number for "Transfert vers" (e.g., "Transfert vers 29526566 230314" -> "29526566")
-        outgoing['ToAccount'] = outgoing['LIBELLE'].str.extract(r'Transfert vers (\d+)', expand=False)
-        
-        # For Mandat, we'll match by amount and date only
-        outgoing['IsMandat'] = outgoing['LIBELLE'].str.contains('Mandat', case=False, na=False)
-        
-        # Create a match key: Date + Amount + ToAccount (for transfers) or Date + Amount (for mandats)
-        outgoing['MatchKey'] = outgoing.apply(
-            lambda row: f"{row['DATE'].strftime('%Y-%m-%d')}_{row['MONTANT']:.2f}_{row['ToAccount'] if pd.notna(row['ToAccount']) else 'MANDAT'}", 
-            axis=1
-        )
-        
-        return outgoing.reset_index(drop=True)
-    return pd.DataFrame()
+    if 'LIBELLE' not in filtered.columns or filtered.empty:
+        return pd.DataFrame()
+    
+    # Include both "Transfert vers" and "Mandat"
+    outgoing = filtered[
+        filtered['LIBELLE'].str.contains('Transfert vers', case=False, na=False) |
+        filtered['LIBELLE'].str.contains('Mandat', case=False, na=False)
+    ].copy()
+    
+    if outgoing.empty:
+        return pd.DataFrame()
+    
+    outgoing['MONTANT'] = outgoing['MONTANT'].abs()  # Make positive for comparison
+    
+    # Extract account number for "Transfert vers" (e.g., "Transfert vers 29526566 230314" -> "29526566")
+    outgoing['ToAccount'] = outgoing['LIBELLE'].apply(
+        lambda x: re.search(r'Transfert vers (\d+)', str(x)).group(1) if re.search(r'Transfert vers (\d+)', str(x)) else None
+    )
+    
+    # For Mandat, we'll match by amount and date only
+    outgoing['IsMandat'] = outgoing['LIBELLE'].str.contains('Mandat', case=False, na=False)
+    
+    # Create a match key: Date + Amount + ToAccount (for transfers) or Date + Amount + MANDAT (for mandats)
+    def create_match_key(row):
+        date_str = row['DATE'].strftime('%Y-%m-%d')
+        amount_str = f"{row['MONTANT']:.2f}"
+        if pd.notna(row['ToAccount']) and row['ToAccount']:
+            return f"{date_str}_{amount_str}_{row['ToAccount']}"
+        else:
+            return f"{date_str}_{amount_str}_MANDAT"
+    
+    outgoing['MatchKey'] = outgoing.apply(create_match_key, axis=1)
+    
+    return outgoing.reset_index(drop=True)
 
 
 def get_in_transactions_p2p(df):
@@ -176,32 +206,41 @@ def get_in_transactions_p2p(df):
 
 def get_out_transactions_p2p(df):
     """Get outgoing transactions from P2P Statement (WITHDRAWAL + CASHOUT)"""
-    if 'Type' in df.columns:
-        # Include both WITHDRAWAL and CASHOUT
-        withdrawals = df[
-            (df['Type'] == 'WITHDRAWAL') | (df['Type'] == 'CASHOUT')
-        ].copy()
-        
-        if 'Amount' in withdrawals.columns:
-            withdrawals['Amount'] = withdrawals['Amount'].abs()  # Make positive for comparison
-            withdrawals['Adjusted_Amount'] = withdrawals['Amount']  # No fee adjustment for withdrawals
-        
-        # Get To Account for WITHDRAWAL, empty for CASHOUT
-        if 'To Account' in withdrawals.columns:
-            withdrawals['ToAccount'] = withdrawals['To Account'].apply(
-                lambda x: str(int(x)) if pd.notna(x) else ''
-            )
-        else:
-            withdrawals['ToAccount'] = ''
-        
-        # Create match key: Date + Amount + ToAccount (for WITHDRAWAL) or Date + Amount + MANDAT (for CASHOUT)
-        withdrawals['MatchKey'] = withdrawals.apply(
-            lambda row: f"{row['Date'].strftime('%Y-%m-%d')}_{row['Amount']:.2f}_{row['ToAccount'] if row['ToAccount'] != '' else 'MANDAT'}", 
-            axis=1
+    if 'Type' not in df.columns:
+        return pd.DataFrame()
+    
+    # Include both WITHDRAWAL and CASHOUT
+    withdrawals = df[
+        (df['Type'] == 'WITHDRAWAL') | (df['Type'] == 'CASHOUT')
+    ].copy()
+    
+    if withdrawals.empty:
+        return pd.DataFrame()
+    
+    if 'Amount' in withdrawals.columns:
+        withdrawals['Amount'] = withdrawals['Amount'].abs()  # Make positive for comparison
+        withdrawals['Adjusted_Amount'] = withdrawals['Amount']  # No fee adjustment for withdrawals
+    
+    # Get To Account for WITHDRAWAL, empty for CASHOUT
+    if 'To Account' in withdrawals.columns:
+        withdrawals['ToAccount'] = withdrawals['To Account'].apply(
+            lambda x: str(int(x)) if pd.notna(x) and x != '' else ''
         )
-        
-        return withdrawals.reset_index(drop=True)
-    return pd.DataFrame()
+    else:
+        withdrawals['ToAccount'] = ''
+    
+    # Create match key: Date + Amount + ToAccount (for WITHDRAWAL) or Date + Amount + MANDAT (for CASHOUT)
+    def create_match_key(row):
+        date_str = row['Date'].strftime('%Y-%m-%d')
+        amount_str = f"{row['Amount']:.2f}"
+        if row['ToAccount'] and row['ToAccount'] != '':
+            return f"{date_str}_{amount_str}_{row['ToAccount']}"
+        else:
+            return f"{date_str}_{amount_str}_MANDAT"
+    
+    withdrawals['MatchKey'] = withdrawals.apply(create_match_key, axis=1)
+    
+    return withdrawals.reset_index(drop=True)
 
 
 def reconcile_transactions(card_df, p2p_df, direction='IN'):
@@ -786,4 +825,4 @@ else:
 
 # Footer
 st.markdown("---")
-st.caption("Card Reconciliation Tool v2.2 | IN: Auth match | OUT: Date+Amount+Account match")
+st.caption("Card Reconciliation Tool v2.3 | IN: Auth match | OUT: Date+Amount+Account match")
