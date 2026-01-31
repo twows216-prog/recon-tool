@@ -181,14 +181,27 @@ def get_out_transactions_card(df, from_date):
     return outgoing.reset_index(drop=True)
 
 
-def get_in_transactions_p2p(df):
+def get_in_transactions_p2p(df, from_date):
     """Get incoming transactions from P2P Statement (DEPOSIT)"""
     if 'Type' in df.columns:
         deposits = df[df['Type'] == 'DEPOSIT'].copy()
     else:
         deposits = df.copy()
     
+    if deposits.empty:
+        return pd.DataFrame()
+    
+    # Apply date filter
+    if 'Date' in deposits.columns:
+        deposits = deposits[deposits['Date'] >= from_date].copy()
+    
+    if deposits.empty:
+        return pd.DataFrame()
+    
     deposits = deposits[deposits['Auth'] != ''].copy()
+    
+    if deposits.empty:
+        return pd.DataFrame()
     
     if 'Amount' in deposits.columns:
         deposits['Adjusted_Amount'] = deposits['Amount'].apply(
@@ -199,7 +212,7 @@ def get_in_transactions_p2p(df):
     return deposits.reset_index(drop=True)
 
 
-def get_out_transactions_p2p(df):
+def get_out_transactions_p2p(df, from_date):
     """Get outgoing transactions from P2P Statement (WITHDRAWAL + CASHOUT)"""
     if 'Type' not in df.columns:
         return pd.DataFrame()
@@ -208,6 +221,13 @@ def get_out_transactions_p2p(df):
     withdrawals = df[
         (df['Type'] == 'WITHDRAWAL') | (df['Type'] == 'CASHOUT')
     ].copy()
+    
+    if withdrawals.empty:
+        return pd.DataFrame()
+    
+    # Apply date filter
+    if 'Date' in withdrawals.columns:
+        withdrawals = withdrawals[withdrawals['Date'] >= from_date].copy()
     
     if withdrawals.empty:
         return pd.DataFrame()
@@ -691,12 +711,12 @@ if card_files and p2p_files:
                         
                         # Get IN transactions
                         card_in = get_in_transactions_card(card_df, from_date_dt)
-                        p2p_in = get_in_transactions_p2p(p2p_df)
+                        p2p_in = get_in_transactions_p2p(p2p_df, from_date_dt)
                         results_in = reconcile_transactions(card_in, p2p_in, 'IN')
                         
                         # Get OUT transactions
                         card_out = get_out_transactions_card(card_df, from_date_dt)
-                        p2p_out = get_out_transactions_p2p(p2p_df)
+                        p2p_out = get_out_transactions_p2p(p2p_df, from_date_dt)
                         results_out = reconcile_transactions(card_out, p2p_out, 'OUT')
                         
                         all_results[card_num] = {
@@ -820,4 +840,4 @@ else:
 
 # Footer
 st.markdown("---")
-st.caption("Card Reconciliation Tool v2.4 | Flexible file naming | IN: Auth match | OUT: Date+Amount+Account match")
+st.caption("Card Reconciliation Tool v2.5 | Date filter applies to both files | IN: Auth match | OUT: Date+Amount+Account match")
