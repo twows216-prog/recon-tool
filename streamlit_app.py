@@ -139,7 +139,19 @@ def get_out_transactions_card(df, from_date):
             filtered['LIBELLE'].str.contains('Mandat', case=False, na=False)
         ].copy()
         outgoing['MONTANT'] = outgoing['MONTANT'].abs()  # Make positive for comparison
-        outgoing['Auth'] = outgoing['Auth'].astype(str)
+        
+        # Extract account number for "Transfert vers" (e.g., "Transfert vers 29526566 230314" -> "29526566")
+        outgoing['ToAccount'] = outgoing['LIBELLE'].str.extract(r'Transfert vers (\d+)', expand=False)
+        
+        # For Mandat, we'll match by amount and date only
+        outgoing['IsMandat'] = outgoing['LIBELLE'].str.contains('Mandat', case=False, na=False)
+        
+        # Create a match key: Date + Amount + ToAccount (for transfers) or Date + Amount (for mandats)
+        outgoing['MatchKey'] = outgoing.apply(
+            lambda row: f"{row['DATE'].strftime('%Y-%m-%d')}_{row['MONTANT']:.2f}_{row['ToAccount'] if pd.notna(row['ToAccount']) else 'MANDAT'}", 
+            axis=1
+        )
+        
         return outgoing.reset_index(drop=True)
     return pd.DataFrame()
 
@@ -169,13 +181,25 @@ def get_out_transactions_p2p(df):
         withdrawals = df[
             (df['Type'] == 'WITHDRAWAL') | (df['Type'] == 'CASHOUT')
         ].copy()
-        withdrawals = withdrawals[withdrawals['Auth'] != ''].copy()
         
         if 'Amount' in withdrawals.columns:
             withdrawals['Amount'] = withdrawals['Amount'].abs()  # Make positive for comparison
             withdrawals['Adjusted_Amount'] = withdrawals['Amount']  # No fee adjustment for withdrawals
         
-        withdrawals['Auth'] = withdrawals['Auth'].astype(str)
+        # Get To Account for WITHDRAWAL, empty for CASHOUT
+        if 'To Account' in withdrawals.columns:
+            withdrawals['ToAccount'] = withdrawals['To Account'].apply(
+                lambda x: str(int(x)) if pd.notna(x) else ''
+            )
+        else:
+            withdrawals['ToAccount'] = ''
+        
+        # Create match key: Date + Amount + ToAccount (for WITHDRAWAL) or Date + Amount + MANDAT (for CASHOUT)
+        withdrawals['MatchKey'] = withdrawals.apply(
+            lambda row: f"{row['Date'].strftime('%Y-%m-%d')}_{row['Amount']:.2f}_{row['ToAccount'] if row['ToAccount'] != '' else 'MANDAT'}", 
+            axis=1
+        )
+        
         return withdrawals.reset_index(drop=True)
     return pd.DataFrame()
 
@@ -193,12 +217,21 @@ def reconcile_transactions(card_df, p2p_df, direction='IN'):
             'missing_amount': 0
         }
     
-    card_auths = set(card_df['Auth'].dropna()) if not card_df.empty else set()
-    p2p_auths = set(p2p_df['Auth'].dropna()) if not p2p_df.empty else set()
+    # For IN transactions, use Auth code; for OUT, use MatchKey
+    if direction == 'IN':
+        card_keys = set(card_df['Auth'].dropna()) if not card_df.empty else set()
+        p2p_keys = set(p2p_df['Auth'].dropna()) if not p2p_df.empty else set()
+        key_field_card = 'Auth'
+        key_field_p2p = 'Auth'
+    else:  # OUT
+        card_keys = set(card_df['MatchKey'].dropna()) if not card_df.empty and 'MatchKey' in card_df.columns else set()
+        p2p_keys = set(p2p_df['MatchKey'].dropna()) if not p2p_df.empty and 'MatchKey' in p2p_df.columns else set()
+        key_field_card = 'MatchKey'
+        key_field_p2p = 'MatchKey'
     
-    missing_in_p2p = card_auths - p2p_auths
-    missing_in_card = p2p_auths - card_auths
-    matched = card_auths & p2p_auths
+    missing_in_p2p = card_keys - p2p_keys
+    missing_in_card = p2p_keys - card_keys
+    matched = card_keys & p2p_keys
     
     results = {
         'summary': {
@@ -215,13 +248,13 @@ def reconcile_transactions(card_df, p2p_df, direction='IN'):
     }
     
     # Missing in P2P
-    for auth in missing_in_p2p:
+    for key in missing_in_p2p:
         if not card_df.empty:
-            rows = card_df[card_df['Auth'] == auth]
+            rows = card_df[card_df[key_field_card] == key]
             if not rows.empty:
                 row = rows.iloc[0]
                 results['missing_in_p2p'].append({
-                    'Auth': auth,
+                    'Auth': row.get('Auth', key) if direction == 'IN' else row.get('ToAccount', '-'),
                     'Date': row['DATE'].strftime('%d/%m/%Y'),
                     'Time': str(row.get('HEURE', '')).strip(),
                     'Amount': abs(row['MONTANT']),
@@ -229,16 +262,17 @@ def reconcile_transactions(card_df, p2p_df, direction='IN'):
                 })
     
     # Missing in Card
-    for auth in missing_in_card:
+    for key in missing_in_card:
         if not p2p_df.empty:
-            rows = p2p_df[p2p_df['Auth'] == auth]
+            rows = p2p_df[p2p_df[key_field_p2p] == key]
             if not rows.empty:
                 row = rows.iloc[0]
                 results['missing_in_card'].append({
-                    'Auth': auth,
+                    'Auth': row.get('Auth', '-') if direction == 'IN' else row.get('ToAccount', '-'),
                     'Date': row['Date'].strftime('%d/%m/%Y'),
                     'Time': str(row.get('Time', '')),
-                    'Amount': row['Amount']
+                    'Amount': row['Amount'],
+                    'Type': row.get('Type', '-')
                 })
     
     # Matched details
@@ -246,9 +280,9 @@ def reconcile_transactions(card_df, p2p_df, direction='IN'):
     total_p2p = 0
     total_adjusted = 0
     
-    for auth in sorted(matched):
-        card_rows = card_df[card_df['Auth'] == auth]
-        p2p_rows = p2p_df[p2p_df['Auth'] == auth]
+    for key in sorted(matched):
+        card_rows = card_df[card_df[key_field_card] == key]
+        p2p_rows = p2p_df[p2p_df[key_field_p2p] == key]
         
         if not card_rows.empty and not p2p_rows.empty:
             card_row = card_rows.iloc[0]
@@ -267,7 +301,7 @@ def reconcile_transactions(card_df, p2p_df, direction='IN'):
             fee_applied = "Yes" if p2p_amt > 40 and direction == 'IN' else "No"
             
             detail = {
-                'Auth': auth,
+                'Auth': card_row.get('Auth', '-') if direction == 'IN' else card_row.get('ToAccount', '-'),
                 'Date': card_row['DATE'].strftime('%d/%m/%Y'),
                 'P2P_Amount': p2p_amt,
                 'Adjusted_Amount': round(adj_amt, 2),
@@ -528,10 +562,8 @@ st.markdown('<div class="sub-header">Compare Card Journal vs P2P Statement</div>
 
 st.info("""
 **Rules:**
-- 📥 **IN (Deposits):** 1% fee removed from P2P amounts > 40
-- 📤 **OUT (Withdrawals):** No fee adjustment
-  - Card Journal: "Transfert vers" + "Mandat"
-  - P2P Statement: WITHDRAWAL + CASHOUT
+- 📥 **IN (Deposits):** Match by Auth code | 1% fee removed from P2P amounts > 40
+- 📤 **OUT (Withdrawals/Cashouts):** Match by Date + Amount + Account | No fee adjustment
 """)
 
 # File upload section
@@ -754,4 +786,4 @@ else:
 
 # Footer
 st.markdown("---")
-st.caption("Card Reconciliation Tool v2.1 | IN: Deposits (1% fee > 40) | OUT: Transfers + Mandats + Cashouts")
+st.caption("Card Reconciliation Tool v2.2 | IN: Auth match | OUT: Date+Amount+Account match")
