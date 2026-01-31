@@ -142,17 +142,19 @@ def get_in_transactions_card(df, from_date):
     return incoming.reset_index(drop=True)
 
 
-def get_out_transactions_card(df, from_date):
+def get_out_transactions_card(df, from_date, include_mandat=True, include_cashout=True):
     """Get outgoing transactions from Card Journal (Transfert vers + Mandat)"""
     filtered = df[df['DATE'] >= from_date].copy()
     if 'LIBELLE' not in filtered.columns or filtered.empty:
         return pd.DataFrame()
     
-    # Include both "Transfert vers" and "Mandat"
-    outgoing = filtered[
-        filtered['LIBELLE'].str.contains('Transfert vers', case=False, na=False) |
-        filtered['LIBELLE'].str.contains('Mandat', case=False, na=False)
-    ].copy()
+    # Build filter conditions based on options
+    conditions = filtered['LIBELLE'].str.contains('Transfert vers', case=False, na=False)
+    
+    if include_mandat:
+        conditions = conditions | filtered['LIBELLE'].str.contains('Mandat', case=False, na=False)
+    
+    outgoing = filtered[conditions].copy()
     
     if outgoing.empty:
         return pd.DataFrame()
@@ -212,15 +214,18 @@ def get_in_transactions_p2p(df, from_date):
     return deposits.reset_index(drop=True)
 
 
-def get_out_transactions_p2p(df, from_date):
+def get_out_transactions_p2p(df, from_date, include_cashout=True):
     """Get outgoing transactions from P2P Statement (WITHDRAWAL + CASHOUT)"""
     if 'Type' not in df.columns:
         return pd.DataFrame()
     
-    # Include both WITHDRAWAL and CASHOUT
-    withdrawals = df[
-        (df['Type'] == 'WITHDRAWAL') | (df['Type'] == 'CASHOUT')
-    ].copy()
+    # Build filter conditions based on options
+    conditions = (df['Type'] == 'WITHDRAWAL')
+    
+    if include_cashout:
+        conditions = conditions | (df['Type'] == 'CASHOUT')
+    
+    withdrawals = df[conditions].copy()
     
     if withdrawals.empty:
         return pd.DataFrame()
@@ -617,7 +622,8 @@ st.markdown('<div class="sub-header">Compare Card Journal vs P2P Statement</div>
 st.info("""
 **Rules:**
 - 📥 **IN (Deposits):** Match by Auth code | 1% fee removed from P2P amounts > 40
-- 📤 **OUT (Withdrawals/Cashouts):** Match by Date + Amount + Account | No fee adjustment
+- 📤 **OUT (Withdrawals):** Match by Date + Amount + Account | No fee adjustment
+- Use checkboxes below to include/exclude Mandat and Cashout from OUT reconciliation
 """)
 
 # File upload section
@@ -648,11 +654,22 @@ with col2:
 
 # Date input
 st.markdown("---")
-from_date = st.date_input(
-    "📅 Starting Date",
-    value=datetime(2026, 1, 27),
-    format="DD/MM/YYYY"
-)
+col_date, col_options = st.columns([1, 2])
+
+with col_date:
+    from_date = st.date_input(
+        "📅 Starting Date",
+        value=datetime(2026, 1, 27),
+        format="DD/MM/YYYY"
+    )
+
+with col_options:
+    st.markdown("**OUT Transaction Options:**")
+    col_opt1, col_opt2 = st.columns(2)
+    with col_opt1:
+        include_mandat = st.checkbox("Include Mandat", value=True)
+    with col_opt2:
+        include_cashout = st.checkbox("Include Cashout", value=True)
 
 # Process files
 if card_files and p2p_files:
@@ -715,8 +732,8 @@ if card_files and p2p_files:
                         results_in = reconcile_transactions(card_in, p2p_in, 'IN')
                         
                         # Get OUT transactions
-                        card_out = get_out_transactions_card(card_df, from_date_dt)
-                        p2p_out = get_out_transactions_p2p(p2p_df, from_date_dt)
+                        card_out = get_out_transactions_card(card_df, from_date_dt, include_mandat, include_cashout)
+                        p2p_out = get_out_transactions_p2p(p2p_df, from_date_dt, include_cashout)
                         results_out = reconcile_transactions(card_out, p2p_out, 'OUT')
                         
                         all_results[card_num] = {
@@ -840,4 +857,4 @@ else:
 
 # Footer
 st.markdown("---")
-st.caption("Card Reconciliation Tool v2.5 | Date filter applies to both files | IN: Auth match | OUT: Date+Amount+Account match")
+st.caption("Card Reconciliation Tool v2.6 | Optional Mandat/Cashout | IN: Auth match | OUT: Date+Amount+Account match")
