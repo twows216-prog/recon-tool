@@ -9,7 +9,7 @@ import re
 from datetime import datetime
 from io import BytesIO
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Border, Side
+from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 
 
 # ============== PAGE CONFIG ==============
